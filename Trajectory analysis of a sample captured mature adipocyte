@@ -1,0 +1,218 @@
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(AnnotationHub)
+
+############ Read data ############################
+
+seurat_data <- Read10X(data.dir = "/dmpi/analysis/RGupta/220824_Hemangioma/H7_involuting")
+seurat_obj <- CreateSeuratObject(counts = seurat_data, 
+                                         min.features = 100)
+
+seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA) / log10(seurat_obj$nCount_RNA)
+seurat_obj$mitoRatio <- PercentageFeatureSet(object = seurat_obj, pattern = "^MT-")
+seurat_obj$mitoRatio <- seurat_obj@meta.data$mitoRatio / 100
+
+filtered_seurat <- subset(x = seurat_obj, 
+                         subset= (nCount_RNA >= 500) & 
+                           (nFeature_RNA >= 250) & 
+                           (log10GenesPerUMI > 0.80) & 
+                           (mitoRatio < 0.20))
+
+############ Filter data ############################
+
+
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+nonzero <- counts > 0
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+filtered_counts <- counts[keep_genes, ]
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+save(filtered_seurat, file=".H7_filtered.RData")
+filtered_seurat<- NormalizeData(filtered_seurat)
+
+############ Assess cell cycle and its associated impact ############################
+cc_file <- getURL("https://raw.githubusercontent.com/hbc/tinyatlas/master/cell_cycle/Homo_sapiens.csv") 
+cell_cycle_genes <- read.csv(text = cc_file)
+ah <- AnnotationHub()
+ahDb <- query(ah, 
+              pattern = c("Homo sapiens", "EnsDb"), 
+              ignore.case = TRUE)
+id <- ahDb %>%
+        mcols() %>%
+        rownames() %>%
+        tail(n = 1)
+edb <- ah[[id]]
+annotations <- genes(edb, 
+                     return.type = "data.frame")
+annotations <- annotations %>%
+        dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+cell_cycle_markers <- dplyr::left_join(cell_cycle_genes, annotations, by = c("geneID" = "gene_id"))
+s_genes <- cell_cycle_markers %>%
+        dplyr::filter(phase == "S") %>%
+        pull("gene_name")
+g2m_genes <- cell_cycle_markers %>%
+        dplyr::filter(phase == "G2/M") %>%
+        pull("gene_name")
+
+filtered_seurat <- CellCycleScoring(filtered_seurat, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+filtered_seurat <- FindVariableFeatures(filtered_seurat, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+filtered_seurat <- ScaleData(filtered_seurat)
+filtered_seurat <- RunPCA(filtered_seurat)
+DimPlot(filtered_seurat,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+        
+
+filtered_seurat@meta.data$mitoFr <- cut(filtered_seurat@meta.data$mitoRatio, 
+                   breaks=c(-Inf, 0.0144, 0.0199, 0.0267, Inf), 
+                   labels=c("Low","Medium","Medium high", "High"))
+
+filtered_seurat <- RunPCA(filtered_seurat)
+DimPlot(filtered_seurat,
+        reduction = "pca",
+        group.by= "mitoFr",
+        split.by = "mitoFr")
+        
+ ############ Conduct culustering ############################
+ 
+filtered_seurat<-NormalizeData(filtered_seurat)
+filtered_seurat <- FindVariableFeatures(filtered_seurat, selection.method = "vst", nfeatures = 2000)
+
+
+
+all.genes <- rownames(filtered_seurat)
+filtered_seurat <- ScaleData(filtered_seurat, features = all.genes)
+
+filtered_seurat <- RunPCA(filtered_seurat, features = VariableFeatures(object = filtered_seurat))
+
+
+VizDimLoadings(filtered_seurat, dims = 1:15, reduction = "pca") & 
+  theme(axis.text=element_text(size=5), axis.title=element_text(size=8,face="bold"))
+
+DimHeatmap(filtered_seurat, dims = 1:15, nfeatures = 20, cells = 500, balanced = T)
+DimPlot(filtered_seurat, reduction = "pca")
+ElbowPlot(filtered_seurat)
+
+filtered_seurat <- FindNeighbors(filtered_seurat, dims = 1:15)
+filtered_seurat <- FindClusters(filtered_seurat, resolution = c(0.05,0.1,0.2,0.5))
+
+Idents(object = filtered_seurat) <- "RNA_snn_res.0.5"
+
+filtered_seurat <- RunUMAP(filtered_seurat, dims = 1:10, verbose = F)
+table(filtered_seurat@meta.data$seurat_clusters)
+DimPlot(filtered_seurat,label.size = 4,repel = T,label = T)
+
+filtered_seurat <- RunTSNE(object = filtered_seurat)
+
+DimPlot(object = filtered_seurat,
+        label = TRUE,
+        reduction = "umap")
+
+############ Mannual identify sub-clusters for trajectory ############################
+ 
+VlnPlot(filtered_seurat,features =c("PECAM1","TFPI2","SLC2A1","TFP1A","ACTA2","ADIPOQ") ,stack=T, flip=T,pt.size = 1, adjust=1,raster=FALSE)
+FeaturePlot(filtered_seurat,features = c("SLC2A1"),reduction = "umap",raster=FALSE)
+
+tragetory_subset<-subset(x = filtered_seurat, idents = c("4","6","11","13"))
+
+tragetory_subset<-RenameIdents(object = tragetory_subset, 
+                            "4"= "GLUT1_pos_Stem_cell",
+                               "6"= "SMC",
+                            "11"= "Endo",
+                            "13" = "Adipocyte")
+DimPlot(object = tragetory_subset,
+        label = TRUE,
+        reduction = "umap")
+
+
+############ Reclustering for trajectory ############################
+tragetory_subset <- FindNeighbors(tragetory_subset, dims = 1:15)
+tragetory_subset <- FindClusters(tragetory_subset, resolution = 0.1)
+tragetory_subset <- RunUMAP(tragetory_subset, dims = 1:15, verbose = F)
+DimPlot(object = tragetory_subset,
+        label = TRUE,
+        reduction = "umap")
+
+VlnPlot(tragetory_subset,features =c("PECAM1","TFPI2","SLC2A1","TFP1A","ACTA2","ADIPOQ") ,stack=T, flip=T,pt.size = 1, adjust=1,raster=FALSE)
+
+FeaturePlot(tragetory_subset,features = c("SLC2A1"),reduction = "umap",raster=FALSE)
+
+tragetory_subset<-RenameIdents(object = tragetory_subset, 
+                            "0"= "GLUT1_pos_Stem_cell",
+                               "1"= "SMC",
+                            "2"= "Endo",
+                            "3" = "Adipocyte")
+
+DimPlot(object = tragetory_subset,
+        label = TRUE,
+        reduction = "umap")
+
+############ Conduct trajectory using monocle3 ############################
+library(monocle3)
+
+cds <- as.cell_data_set(tragetory_subset)
+cds <- cluster_cells(cds, resolution=1e-5)
+
+p1 <- plot_cells(cds, color_cells_by = "cluster", show_trajectory_graph = FALSE)
+p2 <- plot_cells(cds, color_cells_by = "partition", show_trajectory_graph = FALSE)
+wrap_plots(p1, p2)
+
+integrated.sub <- subset(as.Seurat(cds, assay = NULL), monocle3_partitions == 1)
+cds <- as.cell_data_set(integrated.sub)
+
+cds <- learn_graph(cds, use_partition = TRUE, verbose = FALSE)
+
+plot_cells(cds,
+           color_cells_by = "cluster",
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE)
+
+cds <- order_cells(cds, root_cells = colnames(cds[,clusters(cds) == 4]))
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           label_roots = FALSE,
+           trajectory_graph_color = "grey60")
+
+integrated.sub <- as.Seurat(cds, assay = NULL)
+FeaturePlot(integrated.sub, "monocle3_pseudotime")
+
+cds_graph_test_results <- graph_test(cds,
+                                     neighbor_graph = "principal_graph",
+                                     cores = 8)
+
+rowData(cds)$gene_short_name <- row.names(rowData(cds))
+
+head(cds_graph_test_results, error=FALSE, message=FALSE, warning=FALSE)
+
+deg_ids <- rownames(subset(cds_graph_test_results[order(cds_graph_test_results$morans_I, decreasing = TRUE),], q_value < 0.05))
+
+plot_cells(cds,
+           genes=head(deg_ids),
+           show_trajectory_graph = FALSE,
+           label_cell_groups = FALSE,
+           label_leaves = FALSE)
+           
+           
+           
+plot_cells(cds,
+           genes=c("MIR503HG","SLC2A1"),
+           show_trajectory_graph = T,
+           label_cell_groups = T,
+           label_leaves = FALSE)           
+
