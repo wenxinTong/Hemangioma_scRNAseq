@@ -1,0 +1,386 @@
+Download the public cavernous scRNAseq dataset from GSE188515 which is associated with the publication on " Front Cell Dev Biol. 2022; 10: 916045." with PMID: 35865633
+
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(AnnotationHub)
+
+########## Re-analyzed the public Gao_cavernous scRNAseq dataset #################
+
+barcode<-read.delim("barcode.txt", header = TRUE, sep = "\t")
+head(barcode)
+
+out <- strsplit(barcode$cell_id.cell_barcode.celltype,' ') 
+a<-do.call(rbind, out)
+
+meta.data<-as.data.frame(a)
+colnames(meta.data)<-c("cell_n","cell_id","cell_type")
+
+
+matrix<-read.delim2("matri.txt", header = TRUE, sep = "\t", dec = ",")
+
+head(matrix)
+rownames(matrix)<-matrix$symbol
+counts<-matrix[,-1]
+
+ncol(counts)
+nrow(meta.data)
+
+colnames(counts)<-meta.data$cell_id
+
+record_seurat<-CreateSeuratObject(counts = counts, meta.data = meta.data)
+
+record_seurat<- NormalizeData(record_seurat)
+record_seurat <- FindVariableFeatures(record_seurat, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+record_seurat<-ScaleData(record_seurat)
+record_seurat <- RunPCA(record_seurat, features = VariableFeatures(object = record_seurat))
+
+update.packages("culpable")
+record_seurat <- FindNeighbors(record_seurat, dims = 1:15)
+record_seurat <- FindClusters(record_seurat, resolution = 0.50)
+record_seurat <- RunTSNE(record_seurat, dims = 1:15)
+record_seurat <- RunUMAP(record_seurat, dims = 1:15)
+
+DimPlot(record_seurat, reduction = "umap", label = TRUE, )
+
+VlnPlot(record_seurat,features =c("C3","CREB3L1","EDNRA","PYCR1","RGS5","PLVAP","TFF3","TIE1","IL7R","CCL5","GNLY","IGKC","CD68","CD79A","EREG","C1QB","TPSAB1","CLEC10A","FLT3","CLEC9A","NKG7","KLRB1") ,stack=T, flip=T,pt.size = 1, adjust=1)
+
+record_seurat<-RenameIdents(object = record_seurat, 
+                               "0" = "M2_Macrophage",
+                               "1"= "Fibroblast_1",
+                            "2"= "Fibroblast_2",
+                            "3"= "M1_Macrophage",
+                            "4"= "LEC",
+                            "5" = "EC1",
+                               "6"= "SMC",
+                            "7"= "EC2",
+                            "8"= "MSC",
+                            "9"= "T_cell",
+                            "10" = "EC3",
+                               "11"= "NK_cell",
+                            "12"= "MDC",
+                            "13"= "Mast_cell",
+                            "14"= "B_cell",
+                            "15" = "Resident_Macrophage",
+                               "16"= "Activated_B_cells")
+DimPlot(record_seurat, reduction = "umap", label = TRUE, )
+
+save(record_seurat, file="./Gao_cavernous_seurate.RData")
+
+########## Load and analyze our proliferating hemangioma scRNAseq dataset #################
+
+for (file in c("H4_proliferating", "H24_1_proliferating","H24_2_proliferating")){
+        seurat_data <- Read10X(data.dir = paste0("./", file))
+        seurat_obj <- CreateSeuratObject(counts = seurat_data, 
+                                         min.features = 100, 
+                                         project = file)
+        assign(file, seurat_obj)
+}
+
+
+merged_seurat <- merge(x = H4_proliferating, 
+                      y = list(H24_1_proliferating,H24_2_proliferating),
+                      add.cell.id = c("proliferating_H4", "proliferating_H24_1", "proliferating_H24_2"))
+
+head(merged_seurat@meta.data)
+tail(merged_seurat@meta.data)
+
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+metadata <- merged_seurat@meta.data
+metadata$cells <- rownames(metadata)
+metadata <- metadata %>%
+        dplyr::rename(nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+filtered_seurat <- subset(x = merged_seurat, 
+                          subset= (nCount_RNA >= 500) & 
+                            (nFeature_RNA >= 250) & 
+                            (log10GenesPerUMI > 0.80) & 
+                            (mitoRatio < 0.20))
+
+P_split_seurat <- SplitObject(filtered_seurat, split.by = "orig.ident")
+
+P_split_seurat <- lapply(X = P_split_seurat, FUN = function(x) {
+    x <- NormalizeData(x, verbose = FALSE)
+    x <- FindVariableFeatures(x, verbose = FALSE,nfeatures = 3000)
+})
+
+features <- SelectIntegrationFeatures(object.list = P_split_seurat)
+P_split_seurat <- lapply(X = P_split_seurat, FUN = function(x) {
+    x <- ScaleData(x, features = features, verbose = FALSE)
+    x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+anchors <- FindIntegrationAnchors(object.list = P_split_seurat, reference = c(1, 2), reduction = "rpca",
+    dims = 1:50)
+
+proliferating_seurat <- IntegrateData(anchorset = anchors, dims = 1:50)
+proliferating_seurat<-ScaleData(proliferating_seurat, verbose = FALSE)
+proliferating_seurat <- RunPCA(proliferating_seurat, verbose = FALSE)
+proliferating_seurat <- RunUMAP(proliferating_seurat, dims = 1:50)
+
+DimPlot(proliferating_seurat, reduction = "umap", label = TRUE,
+    repel = TRUE)
+
+proliferating_seurat_d15 <- RunPCA(proliferating_seurat, features = VariableFeatures(object = proliferating_seurat))
+proliferating_seurat_d15 <- FindNeighbors(proliferating_seurat_d15, dims = 1:15)
+proliferating_seurat_d15 <- FindClusters(proliferating_seurat_d15, resolution = 0.20)
+proliferating_seurat_d15 <- RunTSNE(proliferating_seurat_d15, dims = 1:15)
+
+
+
+DimPlot(proliferating_seurat_d15, reduction = "umap", label = TRUE)
+DimPlot(proliferating_seurat_d15, reduction = "umap", label = TRUE,split.by = "orig.ident")
+
+anno_proliferating_seurat_d15<-RenameIdents(object = proliferating_seurat_d15, 
+                               "0" = "SMC1",
+                               "1"= "Fibroblast",
+                            "2"= "GLUT1_positive_stem_cell",
+                            "3"= "Endo",
+                            "4"= "SMC2",
+                            "5" = "Macrophage",
+                               "6"= "proliferating_cells",
+                            "7"= "RBC",
+                            "8"= "T_cells",
+                            "9"= "SMC3",
+                            "10" = "Epithelia_cell")
+
+DimPlot(anno_proliferating_seurat_d15, reduction = "umap", label = TRUE)
+save(anno_proliferating_seurat_d15, file="./Gupta_proliferating_seurat.RData")
+
+
+########## Integrate these two datasets #################
+
+DefaultAssay(anno_proliferating_seurat_d15) <- "RNA"
+DefaultAssay(record_seurat) <- "RNA"
+
+
+anno_proliferating_seurat_d15@meta.data$source<-rep("Gupta_proliferating",nrow(anno_proliferating_seurat_d15@meta.data))
+
+record_seurat@meta.data$source<-rep("Gao_cavernous",nrow(record_seurat@meta.data))
+
+
+merged_seurat <- merge(x = anno_proliferating_seurat_d15, 
+                      y = record_seurat,
+                      add.cell.id = c("Gupta_proliferating", "Gao_cavernous"))
+
+split_seurat <- SplitObject(merged_seurat, split.by = "source")
+
+split_seurat <- lapply(X = split_seurat, FUN = function(x) {
+    x <- NormalizeData(x, verbose = FALSE)
+    x <- FindVariableFeatures(x, verbose = FALSE,nfeatures = 3000)
+})
+
+features <- SelectIntegrationFeatures(object.list = split_seurat)
+split_seurat <- lapply(X = split_seurat, FUN = function(x) {
+    x <- ScaleData(x, features = features, verbose = FALSE)
+    x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+anchors <- FindIntegrationAnchors(object.list = split_seurat, reference = c(1, 2), reduction = "rpca",
+    dims = 1:50)
+
+Integrate_seurat <- IntegrateData(anchorset = anchors, dims = 1:50)
+Integrate_seurat<-ScaleData(Integrate_seurat, verbose = FALSE)
+Integrate_seurat <- RunPCA(Integrate_seurat, verbose = FALSE)
+Integrate_seurat <- RunUMAP(Integrate_seurat, dims = 1:50)
+
+DimPlot(Integrate_seurat, reduction = "umap") 
+
+Integrate_seurat_d15 <- RunPCA(Integrate_seurat, features = VariableFeatures(object = Integrate_seurat))
+Integrate_seurat_d15 <- FindNeighbors(Integrate_seurat_d15, dims = 1:15)
+Integrate_seurat_d15 <- FindClusters(Integrate_seurat_d15, resolution = 0.20)
+Integrate_seurat_d15 <- RunTSNE(Integrate_seurat_d15, dims = 1:15)
+
+DimPlot(Integrate_seurat_d15, reduction = "umap", label = TRUE)
+DimPlot(Integrate_seurat_d15, reduction = "umap", label = TRUE,split.by = "source")
+VlnPlot(Integrate_seurat_d15,features =c("C3","PECAM1","TFPI2","ADRB1","CD34","CD68","DCN","HSD17B2","ITGAM","MYH11","DCN1","PTPRC","SLC2A1","TFP1A","VWF","PECAM1","GNLY","IGKC","IR7R","CD79A","EREG","C1QB") ,stack=T, flip=T,pt.size = 1, adjust=1,raster=FALSE,split.by = "source")
+FeaturePlot(Integrate_seurat_d15,features = c("SLC2A1","PECAM1"),reduction = "umap",min.cutoff = "q5", max.cutoff = "q95",raster=FALSE,split.by = "source")
+
+
+
+############## conducting river plot to project Gao_cavernous dataset to Gupta_proliferating ##############
+
+anno_proliferating_seurat_d15@meta.data$cell_type<-Idents(anno_proliferating_seurat_d15)
+
+
+anno_proliferating_seurat_d15 <- RunUMAP(anno_proliferating_seurat_d15, dims = 1:50, return.model = T)
+
+proliferating_reference<- CreateSeuratObject(anno_proliferating_seurat_d15@assays$RNA@counts, meta.data = anno_proliferating_seurat_d15@meta.data)
+
+proliferating_reference <- ScaleData(proliferating_reference)
+proliferating_reference <- NormalizeData(proliferating_reference)
+proliferating_reference <- FindVariableFeatures(proliferating_reference)
+proliferating_reference[["umap"]] <- CreateDimReducObject(embeddings = anno_proliferating_seurat_d15@reductions$umap@cell.embeddings, assay = "RNA", misc = anno_proliferating_seurat_d15@reductions$umap@misc)
+proliferating_reference <- RunPCA(proliferating_reference)
+
+
+record_seurat@meta.data$cell_type<-Idents(record_seurat)
+
+
+proliferating_reference <- FindNeighbors(
+  object = proliferating_reference,
+  reduction = "pca",
+  dims = 1:30,
+  graph.name = "pca.annoy.neighbors", 
+  k.param = 50,
+  cache.index = TRUE,
+  return.neighbor = TRUE,
+  l2.norm = TRUE)
+
+anchors<-FindTransferAnchors(
+    reference = proliferating_reference,
+    query = record_seurat,
+    reference.reduction = "pca", 
+    dims = 1:30)
+
+
+record_seurat_map <- MapQuery(
+    anchorset = anchors, 
+    query = record_seurat,
+    reference = proliferating_reference, 
+    refdata = list(
+      celltype = "cell_type"),
+    reference.reduction = "pca",
+    reduction.model = "umap")
+
+
+record_seurat$predicted.celltype <- "temp"
+
+  cells <- colnames(record_seurat)
+  record_seurat$predicted.celltype[cells] <- record_seurat_map$predicted.celltype
+  embed <- record_seurat_map@reductions$ref.umap@cell.embeddings
+umap <- as.data.frame(embed)
+ 
+record_seurat[["refUMAP"]] <- CreateDimReducObject(as.matrix(umap), key = "refUMAP_", assay = "RNA")
+
+
+
+record_seurat@meta.data$predicted.celltype<-paste0("Gupta_",record_seurat@meta.data$predicted.celltype)
+
+
+edges <- as.data.frame(with(record_seurat@meta.data, table(cell_type, predicted.celltype)))
+names(edges)[names(edges)=="cell_type"] <- "N1"
+edges$N1 <- paste0(edges$N1, "_S1")
+names(edges)[names(edges)=="predicted.celltype"] <- "N2"
+edges$N2 <- paste0(edges$N2, "_L2")
+names(edges)[names(edges)=="Freq"] <- "Value"
+
+nodes = data.frame(ID = unique(c(edges$N1, edges$N2)), stringsAsFactors = FALSE)
+nodes$x = as.numeric(substr(nodes$ID, nchar(nodes$ID), nchar(nodes$ID)))
+
+nodes$labels = as.character(substr(nodes$ID,1,nchar(nodes$ID)-3))
+nodes$col = colors()[seq(2, (length(nodes$ID) * 2), 2)]
+
+r <- riverplot::makeRiver(nodes, edges)
+pdf("mapped-riverplot-all.pdf", height = 6,width = 9)
+print(plot(r, plot_area = .85, srt = 0))
+print(title(main = "Riverplot between Gao_Canvinous (Left Plot) and Mapped Gupta proliferating Identities (Right Plot)"))
+
+
+GLUT1_projection<- subset(record_seurat, subset=predicted.celltype=="Gupta_GLUT1_positive_stem_cell")
+
+save(record_seurat, file="./projecting_Gao_to_Gupta_seurat.RData")
+
+
+############## Subset the datasets to include only endo and SMC clusters to conduct river plot to project Gao_cavernous dataset to Gupta_proliferating ##############
+
+Gao_endo_seurat<- subset(x = record_seurat, idents = c("LEC", "EC1","EC2","MSC","EC3","MDC","SMC"))
+Gao_endo_seurat@meta.data$cell_type<-Idents(Gao_endo_seurat)
+
+Gupta_endo_seurat<- subset(x = anno_proliferating_seurat_d15, idents = c("Endo", "GLUT1_positive_stem_cell","SMC1","SMC2","SMC3"), invert = TRUE)
+
+Gupta_endo_seurat@meta.data$cell_type<-Idents(Gupta_endo_seurat)
+
+
+Gupta_endo_seurat <- RunUMAP(Gupta_endo_seurat, dims = 1:50, return.model = T)
+
+proliferating_endo_reference<- CreateSeuratObject(Gupta_endo_seurat@assays$RNA@counts, meta.data = Gupta_endo_seurat@meta.data)
+
+proliferating_endo_reference <- ScaleData(proliferating_endo_reference)
+proliferating_endo_reference <- NormalizeData(proliferating_endo_reference)
+proliferating_endo_reference <- FindVariableFeatures(proliferating_endo_reference)
+proliferating_endo_reference[["umap"]] <- CreateDimReducObject(embeddings = Gupta_endo_seurat@reductions$umap@cell.embeddings, assay = "RNA", misc = Gupta_endo_seurat@reductions$umap@misc)
+proliferating_endo_reference <- RunPCA(proliferating_endo_reference)
+
+
+
+
+proliferating_endo_reference <- FindNeighbors(
+  object = proliferating_reference,
+  reduction = "pca",
+  dims = 1:30,
+  graph.name = "pca.annoy.neighbors", 
+  k.param = 50,
+  cache.index = TRUE,
+  return.neighbor = TRUE,
+  l2.norm = TRUE)
+
+anchors<-FindTransferAnchors(
+    reference = proliferating_endo_reference,
+    query = Gao_endo_seurat,
+    reference.reduction = "pca", 
+    dims = 1:30)
+
+
+Gao_endo_seurat_map <- MapQuery(
+    anchorset = anchors, 
+    query = Gao_endo_seurat,
+    reference = proliferating_endo_reference, 
+    refdata = list(
+      celltype = "cell_type"),
+    reference.reduction = "pca",
+    reduction.model = "umap")
+
+
+Gao_endo_seurat$predicted.celltype <- "temp"
+
+  cells <- colnames(Gao_endo_seurat)
+  Gao_endo_seurat$predicted.celltype[cells] <- Gao_endo_seurat_map$predicted.celltype
+  embed <- Gao_endo_seurat_map@reductions$ref.umap@cell.embeddings
+umap <- as.data.frame(embed)
+ 
+Gao_endo_seurat[["refUMAP"]] <- CreateDimReducObject(as.matrix(umap), key = "refUMAP_", assay = "RNA")
+
+
+
+Gao_endo_seurat@meta.data$predicted.celltype<-paste0("Gupta_",Gao_endo_seurat@meta.data$predicted.celltype)
+
+
+edges <- as.data.frame(with(Gao_endo_seurat@meta.data, table(cell_type, predicted.celltype)))
+names(edges)[names(edges)=="cell_type"] <- "N1"
+edges$N1 <- paste0(edges$N1, "_S1")
+names(edges)[names(edges)=="predicted.celltype"] <- "N2"
+edges$N2 <- paste0(edges$N2, "_L2")
+names(edges)[names(edges)=="Freq"] <- "Value"
+
+nodes = data.frame(ID = unique(c(edges$N1, edges$N2)), stringsAsFactors = FALSE)
+nodes$x = as.numeric(substr(nodes$ID, nchar(nodes$ID), nchar(nodes$ID)))
+
+nodes$labels = as.character(substr(nodes$ID,1,nchar(nodes$ID)-3))
+nodes$col = colors()[seq(2, (length(nodes$ID) * 2), 2)]
+
+r <- riverplot::makeRiver(nodes, edges)
+pdf("mapped-riverplot-endo.pdf", height = 6,width = 9)
+print(plot(r, plot_area = .85, srt = 0))
+print(title(main = "Riverplot between Gao_Canvinous (Left Plot) and Mapped Gupta proliferating Identities (Right Plot)"))
+
+
+GLUT1_projection<- subset(Gao_endo_seurat, subset=predicted.celltype=="Gupta_GLUT1_positive_stem_cell")
+
+
+DimPlot(GLUT1_projection, reduction = "umap", label = TRUE, )
+
+
+FeaturePlot(GLUT1_projection,features = "SLC2A1")
+save(record_seurat, file="./projecting_Gao_to_Gupta_endo_seurat.RData")
+
